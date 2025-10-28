@@ -1,6 +1,7 @@
 #include <argp.h>
 #include <stdarg.h>
 #include <bpf/libbpf.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include "disasm.h"
@@ -23,6 +24,7 @@ struct bpf_prog {
 struct bpf_verifier_env {
 	struct bpf_prog *prog;
 	struct bpf_iarray *succ;
+	struct bpf_iarray **preds;
 };
 
 #define log_error(fmt, ...) __log_error(__FILE__, __LINE__, fmt, ##__VA_ARGS__)
@@ -98,6 +100,58 @@ static struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 
 		succ->items[succ->cnt++] = idx + bpf_jmp_offset(insn) + 1;
 
 	return succ;
+}
+
+static int compute_predecessors(struct bpf_verifier_env *env)
+{
+	struct bpf_prog *prog = env->prog;
+	struct bpf_insn *insns = prog->insnsi, *insn;
+	u32 *num_preds, i, len = prog->len;
+	struct bpf_iarray *succ, *preds;
+	void *arena;
+
+	num_preds = calloc(sizeof(u32), prog->len);
+	if (!num_preds)
+		return -ENOMEM;
+
+	for (i = 0; i < len; i++) {
+		insn = env->prog->insnsi + i;
+		succ = bpf_insn_successors(env, i);
+		for (int s = 0; s < succ->cnt; s++)
+			num_preds[succ->items[s]]++;
+
+		if (bpf_is_ldimm64(insn))
+			i++;
+	}
+
+	/* TODO: allocate this on arena */
+	env->preds = calloc(sizeof(*env->preds), len);
+	if (!env->preds)
+		goto nomem;
+	for (i = 0; i < len; i++) {
+		env->preds[i] = calloc(sizeof(**env->preds) + sizeof(u32) * num_preds[i], 1);
+		if (!env->preds[i])
+			goto nomem;
+	}
+
+	for (i = 0; i < len; i++) {
+		insn = env->prog->insnsi + i;
+		succ = bpf_insn_successors(env, i);
+		for (int s = 0; s < succ->cnt; s++) {
+			preds = env->preds[succ->items[s]];
+			preds->items[preds->cnt++] = i;
+		}
+
+		if (bpf_is_ldimm64(insn))
+			i++;
+	}
+
+	free(num_preds);
+	return 0;
+
+nomem:
+	free(num_preds);
+	return -ENOMEM;
 }
 
 struct ctx {
@@ -225,9 +279,9 @@ int print_cfg(struct bpf_verifier_env *env, const char *path)
 		return -errno;
 	}
 	fprintf(f, "digraph G {\n");
-	fprintf(f, "  node [colorscheme=ylorbr8, fontname=monospace, shape=box, style=filled];\n");
+	fprintf(f, "  node [fontname=monospace, shape=box, style=filled];\n");
 	char buf[INSN_BUF_SZ];
-	struct bpf_iarray *succ;
+	struct bpf_iarray *succ, *preds;
 	for (int i = 0; i < env->prog->len; i++) {
 		struct bpf_insn *insn = env->prog->insnsi + i;
 		print_insn_str(buf, insn);
@@ -235,6 +289,11 @@ int print_cfg(struct bpf_verifier_env *env, const char *path)
 		succ = bpf_insn_successors(env, i);
 		for (int s = 0; s < succ->cnt; s++)
 			fprintf(f, "  %d -> %d;\n", i, succ->items[s]);
+		/*
+		 * preds = env->preds[i];
+		 * for (int p = 0; p < preds->cnt; p++)
+		 * 	fprintf(f, "  %d -> %d [color=grey];\n", i, preds->items[p]);
+		 */
 		if (bpf_is_ldimm64(insn))
 			i++;
 
@@ -292,9 +351,20 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	err = compute_predecessors(&env);
+	if (err) {
+		log_error("Can't compute predecessors");
+		goto out;
+	}
+
 	if (ctx.cfg)
 		print_cfg(&env, ctx.cfg);
 out:
+	if (env.preds) {
+		for (int i = 0; i < env.prog->len; i++)
+			free(env.preds[i]);
+		free(env.preds);
+	}
 	bpf_object__close(obj);
 	return 0;
 }
