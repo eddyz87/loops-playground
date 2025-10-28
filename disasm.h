@@ -14,6 +14,8 @@
 #include <string.h>
 #endif
 
+#define __printf(a, b) __attribute__((__format__(printf, a, b)))
+
 extern const char *const bpf_alu_string[16];
 extern const char *const bpf_class_string[8];
 

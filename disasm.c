@@ -3,9 +3,16 @@
  * Copyright (c) 2016 Facebook
  */
 
+#include <stdbool.h>
 #include <linux/bpf.h>
 
 #include "disasm.h"
+
+#define BUILD_BUG_ON(...)
+typedef unsigned char u8;
+typedef unsigned short u16;
+typedef unsigned int u32;
+typedef unsigned long u64;
 
 #define __BPF_FUNC_STR_FN(x) [BPF_FUNC_ ## x] = __stringify(bpf_ ## x)
 static const char * const func_id_str[] = {
