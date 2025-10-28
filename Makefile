@@ -4,7 +4,7 @@ jfiles:=$(cfiles:.c=.o.json)
 dfiles:=$(cfiles:.c=.o.d)
 selfdir:=$(realpath .)
 cc:=clang
-cflags=-g -fsanitize=address $(shell pkg-config --cflags libbpf) -I.
+cflags=-g -fsanitize=address $(shell pkg-config --cflags libbpf) -I. -Ilibbpf/include/uapi/
 ldflags=-fsanitize=address $(shell pkg-config --libs libbpf) -lelf -lz
 q:=$(if $(V),,@)
 
