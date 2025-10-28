@@ -21,11 +21,25 @@ struct bpf_prog {
 	u32 len;
 };
 
+struct bpf_subprog_info {
+	u32 start; /* insn idx of function entry point */
+	u32 postorder_start; /* The idx to the env->cfg.insn_postorder */
+};
+
 struct bpf_verifier_env {
 	struct bpf_prog *prog;
+	struct bpf_subprog_info *subprog_info;
 	struct bpf_iarray *succ;
 	struct bpf_iarray **preds;
+	int subprog_cnt;
+	struct {
+		int *insn_postorder;
+		int cur_postorder;
+	} cfg;
 };
+
+#define kvcalloc(sz, num, _) calloc(sz, num)
+#define kvfree(v) free(v)
 
 #define log_error(fmt, ...) __log_error(__FILE__, __LINE__, fmt, ##__VA_ARGS__)
 
@@ -100,6 +114,62 @@ static struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 
 		succ->items[succ->cnt++] = idx + bpf_jmp_offset(insn) + 1;
 
 	return succ;
+}
+
+enum {
+	DISCOVERED = 0x1,
+	EXPLORED = 0x2,
+};
+
+/*
+ * For each subprogram 'i' fill array env->cfg.insn_subprogram sub-range
+ * [env->subprog_info[i].postorder_start, env->subprog_info[i+1].postorder_start)
+ * with indices of 'i' instructions in postorder.
+ */
+static int compute_postorder(struct bpf_verifier_env *env)
+{
+	u32 cur_postorder, i, top, stack_sz, s;
+	int *stack = NULL, *postorder = NULL, *state = NULL;
+	struct bpf_iarray *succ;
+
+	postorder = kvcalloc(env->prog->len, sizeof(int), GFP_KERNEL_ACCOUNT);
+	state = kvcalloc(env->prog->len, sizeof(int), GFP_KERNEL_ACCOUNT);
+	stack = kvcalloc(env->prog->len, sizeof(int), GFP_KERNEL_ACCOUNT);
+	if (!postorder || !state || !stack) {
+		kvfree(postorder);
+		kvfree(state);
+		kvfree(stack);
+		return -ENOMEM;
+	}
+	cur_postorder = 0;
+	for (i = 0; i < env->subprog_cnt; i++) {
+		env->subprog_info[i].postorder_start = cur_postorder;
+		stack[0] = env->subprog_info[i].start;
+		stack_sz = 1;
+		do {
+			top = stack[stack_sz - 1];
+			state[top] |= DISCOVERED;
+			if (state[top] & EXPLORED) {
+				postorder[cur_postorder++] = top;
+				stack_sz--;
+				continue;
+			}
+			succ = bpf_insn_successors(env, top);
+			for (s = 0; s < succ->cnt; ++s) {
+				if (!state[succ->items[s]]) {
+					stack[stack_sz++] = succ->items[s];
+					state[succ->items[s]] |= DISCOVERED;
+				}
+			}
+			state[top] |= EXPLORED;
+		} while (stack_sz);
+	}
+	env->subprog_info[i].postorder_start = cur_postorder;
+	env->cfg.insn_postorder = postorder;
+	env->cfg.cur_postorder = cur_postorder;
+	kvfree(stack);
+	kvfree(state);
+	return 0;
 }
 
 static int compute_predecessors(struct bpf_verifier_env *env)
@@ -337,9 +407,15 @@ int main(int argc, char *argv[])
 		struct bpf_iarray arr;
 		u32 _[3];
 	} succ;
+	struct bpf_subprog_info subprogs[2] = { // TODO: compute me
+		{ .start = 0 },
+		{ .start = cnt },
+	};
 	struct bpf_verifier_env env = {
 		.prog = &vprog,
 		.succ = &succ.arr,
+		.subprog_info = subprogs,
+		.subprog_cnt = 1,
 	};
 
 	if (ctx.print) {
@@ -349,6 +425,12 @@ int main(int argc, char *argv[])
 			if (bpf_is_ldimm64(insn))
 				i++;
 		}
+	}
+
+	err = compute_postorder(&env);
+	if (err) {
+		log_error("Can't compute postorder");
+		goto out;
 	}
 
 	err = compute_predecessors(&env);
@@ -365,6 +447,7 @@ out:
 			free(env.preds[i]);
 		free(env.preds);
 	}
+	free(env.cfg.insn_postorder);
 	bpf_object__close(obj);
 	return 0;
 }
