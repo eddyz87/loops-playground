@@ -1,0 +1,5 @@
+.emacs.force-kernel-c-style
+compile_commands.json
+*.o
+*.o.json
+loops-pg
