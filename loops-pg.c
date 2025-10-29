@@ -26,12 +26,50 @@ struct bpf_subprog_info {
 	u32 postorder_start; /* The idx to the env->cfg.insn_postorder */
 };
 
+struct dfs_state {
+	u32 traversed:1;
+	u32 next_succ:31;
+};
+
+struct loops_info {
+	struct dfs_state *state;/* temporary variable */
+	bool *is_header;	/* true, if node is a loop header */
+	int *loop_header;	/* maps instruction at index to it's innermost loop header */
+	int *irreducible;	/* list of irreducible loop headers */
+	int *dfs_pos;		/* temporary variable */
+	int *stack;		/* temporary variable */
+	int irreducible_cnt;	/* number of elements in irreducible */
+};
+
+
+static void free_loops_info_tmps(struct loops_info *loops)
+{
+	free(loops->dfs_pos);
+	free(loops->stack);
+	free(loops->state);
+	loops->dfs_pos = NULL;
+	loops->stack = NULL;
+	loops->state = NULL;
+}
+
+static void free_loops_info(struct loops_info *loops)
+{
+	free_loops_info_tmps(loops);
+	free(loops->is_header);
+	free(loops->loop_header);
+	free(loops->irreducible);
+	loops->is_header = NULL;
+	loops->loop_header = NULL;
+	loops->irreducible = NULL;
+}
+
 struct bpf_verifier_env {
 	struct bpf_prog *prog;
 	struct bpf_subprog_info *subprog_info;
 	struct bpf_iarray *succ;
 	struct bpf_iarray **preds;
 	int *idoms;
+	struct loops_info loops;
 	int subprog_cnt;
 	struct {
 		int *insn_postorder;
@@ -54,6 +92,19 @@ static void __log_error(const char *file, int line, const char *fmt, ...)
 		file, line, errno, strerror(errno));
 	vfprintf(stderr, fmt, args);
 	va_end(args);
+}
+
+static void *realloc_array(void *arr, size_t old_n, size_t new_n, size_t size)
+{
+	void *tmp;
+
+	tmp = realloc(arr, new_n * size);
+	if (!tmp)
+		return NULL;
+
+	if (new_n > old_n)
+		memset(tmp + old_n * size, 0, (new_n - old_n) * size);
+	return tmp;
 }
 
 static bool bpf_is_ldimm64(const struct bpf_insn *insn)
@@ -182,10 +233,9 @@ static int compute_postorder(struct bpf_verifier_env *env)
 static int compute_predecessors(struct bpf_verifier_env *env)
 {
 	struct bpf_prog *prog = env->prog;
-	struct bpf_insn *insns = prog->insnsi, *insn;
+	struct bpf_insn *insn;
 	u32 *num_preds, i, len = prog->len;
 	struct bpf_iarray *succ, *preds;
-	void *arena;
 
 	num_preds = calloc(sizeof(u32), prog->len);
 	if (!num_preds)
@@ -272,7 +322,6 @@ static void compute_subprog_idoms(struct bpf_verifier_env *env, int subprog_idx)
 {
 	struct bpf_subprog_info *subprog = &env->subprog_info[subprog_idx];
 	int start = subprog->start;
-	int end = (subprog + 1)->start;
 	int po_first = subprog->postorder_start;
 	int po_last = (subprog + 1)->postorder_start - 1;
 	int *idoms = env->idoms;
@@ -286,7 +335,6 @@ static void compute_subprog_idoms(struct bpf_verifier_env *env, int subprog_idx)
 		/* iterate in reverse postorder */
 		for (po_num = po_last; po_num >= po_first; po_num--) {
 			int idx = env->cfg.insn_postorder[po_num];
-			struct bpf_iarray *preds;
 			int new_idom = -1;
 
 			iarray_for_each(pred, env->preds[idx]) {
@@ -331,12 +379,188 @@ static int compute_idoms(struct bpf_verifier_env *env)
 	return 0;
 }
 
+static int mark_irreducible(struct loops_info *loops, int header)
+{
+	int *irreducible;
+
+	irreducible = realloc_array(loops->irreducible,
+				    loops->irreducible_cnt,
+				    loops->irreducible_cnt + 1,
+				    sizeof(int));
+	if (!irreducible)
+		return -ENOMEM;
+
+	loops->irreducible = irreducible;
+	irreducible[loops->irreducible_cnt++] = header;
+	return 0;
+}
+
+static void assign_header(struct loops_info *loops, int n, int h)
+{
+	int *loop_header = loops->loop_header;
+	bool *is_header = loops->is_header;
+	int *dfs_pos = loops->dfs_pos;
+	int nh;
+
+	/*
+	 * printf("assign_header(n=%d, h=%d)\n", n, h);
+	 */
+	is_header[h] = true;
+
+	/* Don't encode self-loops, otherwise can't reflect loops nesting structure. */
+	if (n == h)
+		return;
+
+	/* Make sure that loop headers up the chain are sorted by dfs_pos. */
+	while (loop_header[n] != -1) {
+		nh = loop_header[n];
+		if (nh == h)
+			return;
+		if (dfs_pos[nh] < dfs_pos[h]) {
+			loop_header[n] = h;
+			n = h;
+			h = nh;
+		} else {
+			n = nh;
+		}
+	}
+	loop_header[n] = h;
+}
+
+/*
+ * As described in "A New Algorithm for Identifying Loops in Decompilation" by Wei et al,
+ * adapted to be non-recursive.
+ */
+static int assign_loop_headers_in_subprog(struct bpf_verifier_env *env, int subprog_idx)
+{
+	struct loops_info *loops = &env->loops;
+	struct dfs_state *state = loops->state;
+	int *loop_header = loops->loop_header;
+	int *dfs_pos = loops->dfs_pos;
+	int *stack = loops->stack;
+	int err, s, h, cur, stack_sz;
+	struct bpf_iarray *succ;
+
+	stack[0] = env->subprog_info[subprog_idx].start;
+	state[0].traversed = true;
+	state[0].next_succ = 0;
+	dfs_pos[0] = 1;
+	stack_sz = 1;
+	do {
+		cur = stack[stack_sz - 1];
+		/*
+		 * printf("cur=%d, next_succ=%d\n", cur, state[cur].next_succ);
+		 */
+		succ = bpf_insn_successors(env, cur);
+		if (state[cur].next_succ == succ->cnt) {
+			dfs_pos[cur] = 0;
+			stack_sz--;
+			/*
+			 * printf("cur=%d, pop\n", cur);
+			 */
+			continue;
+		}
+		s = succ->items[state[cur].next_succ];
+		if (!state[s].traversed) {
+			/* Case A:  start -> ... -> cur -> s [unxplored] */
+			/*
+			 * printf("push %d\n", s);
+			 */
+			state[s].traversed = true;
+			state[s].next_succ = 0;
+			stack[stack_sz] = s;
+			dfs_pos[s] = stack_sz + 1;
+			stack_sz++;
+			continue;
+		}
+		/* 's' is fully explored at this point */
+		if (dfs_pos[s]) {
+			/*
+			 * start -> ... -> s -> cur --.
+			 *                 ^          |
+			 *                 '----------'
+			 * Case B: 's' is in the current DFS path.
+			 */
+			assign_header(loops, cur, s);
+		} else if (loop_header[s] == -1) {
+			/*
+			 * start -> ... -> ... -> s -> ... -> end
+			 *           |            ^
+			 *           '---> cur ---'
+			 * Case C: 's' is explored, not in the current DFS path,
+			 * and not a part of any loop.
+			 */
+		} else if (dfs_pos[loop_header[s]]) {
+			/*
+			 *                 .----------------------.
+			 *                 v                      |
+			 * start -> ... -> h -> ... -> ... -> s --'
+			 *                       |            ^
+			 *	                 '---> cur ---'
+			 * Case D: 's' is explored, not in current DFS path,
+			 * but it's innermost loop header is.
+			 */
+			assign_header(loops, cur, loop_header[s]);
+		} else {
+			// case E
+			h = loop_header[s];
+			err = mark_irreducible(loops, h);
+			if (err)
+				return err;
+			/* can also mark 's' as reentry, but no need for now */
+			while (loop_header[h] != -1) {
+				h = loop_header[h];
+				if (dfs_pos[h]) {
+					assign_header(loops, cur, h);
+					break;
+				}
+				err = mark_irreducible(loops, h);
+				if (err)
+					return err;
+			}
+		}
+		state[cur].next_succ++;
+	} while (stack_sz);
+
+	return 0;
+}
+
+static int compute_loops(struct bpf_verifier_env *env)
+{
+	int err, i, len = env->prog->len;
+	struct loops_info *loops = &env->loops;
+
+	loops->loop_header = kvcalloc(len, sizeof(int), GFP_KERNEL_ACCOUNT);
+	loops->is_header = kvcalloc(len, sizeof(bool), GFP_KERNEL_ACCOUNT);
+	loops->dfs_pos = kvcalloc(len, sizeof(int), GFP_KERNEL_ACCOUNT);
+	loops->state = kvcalloc(len, sizeof(struct dfs_state), GFP_KERNEL_ACCOUNT);
+	loops->stack = kvcalloc(len, sizeof(int), GFP_KERNEL_ACCOUNT);
+	if (!loops->loop_header || !loops->dfs_pos || !loops->state || !loops->stack) {
+		err = -ENOMEM;
+		goto err_out;
+	}
+	for (i = 0; i < len; i++)
+		loops->loop_header[i] = -1;
+	for (i = 0; i < env->subprog_cnt; i++) {
+		err = assign_loop_headers_in_subprog(env, i);
+		if (err)
+			goto err_out;
+	}
+	free_loops_info_tmps(loops);
+	return 0;
+
+err_out:
+	free_loops_info(loops);
+	return err;
+}
+
 struct ctx {
 	char *bpf_file;
 	char *bpf_prog;
 	char *cfg;
 	bool print;
 	bool idoms;
+	bool loops;
 };
 
 enum {
@@ -345,6 +569,7 @@ enum {
   OPT_PRINT,
   OPT_CFG,
   OPT_IDOMS,
+  OPT_LOOPS,
 };
 
 static struct argp_option opts[] = {
@@ -352,6 +577,7 @@ static struct argp_option opts[] = {
   { "bpf-prog", OPT_BPF_PROG, "<bpf-prog>", 0, 0 },
   { "cfg", OPT_CFG, "<cfg-dot>", 0, 0 },
   { "idoms", OPT_IDOMS, 0, 0, 0 },
+  { "loops", OPT_LOOPS, 0, 0, 0 },
   { "print", OPT_PRINT, 0, 0, 0 },
   { 0 }
 };
@@ -361,21 +587,12 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
   struct ctx *ctx = state->input;
 
   switch (key) {
-  case OPT_BPF_FILE:
-	  ctx->bpf_file = arg;
-	  break;
-  case OPT_BPF_PROG:
-	  ctx->bpf_prog = arg;
-	  break;
-  case OPT_CFG:
-	  ctx->cfg = arg;
-	  break;
-  case OPT_PRINT:
-	  ctx->print = true;
-	  break;
-  case OPT_IDOMS:
-	  ctx->idoms = true;
-	  break;
+  case OPT_BPF_FILE:	ctx->bpf_file = arg; break;
+  case OPT_BPF_PROG:	ctx->bpf_prog = arg; break;
+  case OPT_CFG:		ctx->cfg = arg; break;
+  case OPT_PRINT:	ctx->print = true; break;
+  case OPT_IDOMS:	ctx->idoms = true; break;
+  case OPT_LOOPS:	ctx->loops = true; break;
   case ARGP_KEY_END:
 	  if (!ctx->bpf_file || !ctx->bpf_prog) {
 		  fprintf(stderr, "Mandatory arguments %s and %s are absent\n", opts[0].name, opts[1].name);
@@ -472,9 +689,31 @@ static int find_span(struct bpf_verifier_env *env, int idx)
 			break;
 		if (env->idoms && env->idoms[s] != idx)
 			break;
+		if (env->loops.is_header && env->loops.is_header[s])
+			break;
 		idx += sz;
 	}
 	return idx;
+}
+
+#define MAX_LOOP_COLORS 7
+
+static int get_loop_level(struct bpf_verifier_env *env, int idx)
+{
+	struct loops_info *loops = &env->loops;
+	int level;
+
+	if (!loops->is_header)
+		return 0;
+
+	level = 0;
+	if (loops->is_header[idx])
+		level += 1;
+	while (loops->loop_header[idx] != -1) {
+		idx = loops->loop_header[idx];
+		level++;
+	}
+	return level;
 }
 
 static int print_cfg(struct bpf_verifier_env *env, const char *path)
@@ -489,11 +728,8 @@ static int print_cfg(struct bpf_verifier_env *env, const char *path)
 	char buf[INSN_BUF_SZ];
 	int *span_start2end = calloc(env->prog->len, sizeof(int));
 	int *span_end2start = calloc(env->prog->len, sizeof(int));
-	if (!span_start2end || !span_end2start) {
-		free(span_start2end);
-		free(span_end2start);
-		return -ENOMEM;
-	}
+	if (!span_start2end || !span_end2start)
+		goto nomem;
 	for (int i = 0; i < env->prog->len; i++) {
 		int j = find_span(env, i);
 		span_start2end[i] = j;
@@ -502,20 +738,34 @@ static int print_cfg(struct bpf_verifier_env *env, const char *path)
 		if (bpf_is_ldimm64(env->prog->insnsi + i))
 			i++;
 	}
-	struct bpf_iarray *succ, *preds;
+	struct bpf_iarray *succ;
 	for (int i = 0; i < env->prog->len; i++) {
 		int j = span_start2end[i];
-		fprintf(stderr, "span %d-%d\n", i, j);
 		fprintf(f, "  %d [label=\"", i);
 		for (int k = i; k <= j; k++) {
 			print_insn_str(buf, env->prog->insnsi + k);
-			fprintf(f, "%d: %-32s p#%d", i, buf, env->cfg.postorder_nums[i]);
+			fprintf(f, "%d: %-32s p#%-3d",
+				k, buf, env->cfg.postorder_nums[k]);
+			int l;
+			if (env->loops.loop_header && ((l = env->loops.loop_header[k]) != -1))
+				fprintf(f, " l#%-3d", l);
+			if (env->loops.is_header && env->loops.is_header[k])
+				fprintf(f, " h");
 			if (i != j)
 				fprintf(f, "\\l");
 			if (bpf_is_ldimm64(env->prog->insnsi + k))
 				k++;
 		}
-		fprintf(f, "\"];\n");
+		fprintf(f, "\"");
+		int loop_level = get_loop_level(env, i);
+		if (loop_level) {
+			fprintf(f, ", fillcolor=%d", loop_level % MAX_LOOP_COLORS);
+			if (env->loops.is_header[i])
+				fprintf(f, ", colorscheme=set27");
+			else
+				fprintf(f, ", colorscheme=pastel27");
+		}
+		fprintf(f, "];\n");
 		succ = bpf_insn_successors(env, j);
 		for (int s = 0; s < succ->cnt; s++)
 			fprintf(f, "  %d -> %d;\n", i, succ->items[s]);
@@ -530,6 +780,10 @@ static int print_cfg(struct bpf_verifier_env *env, const char *path)
 	fprintf(f, "}\n");
 	fclose(f);
 	return 0;
+nomem:
+	free(span_start2end);
+	free(span_end2start);
+	return -ENOMEM;
 }
 
 int main(int argc, char *argv[])
@@ -606,6 +860,17 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (ctx.loops) {
+		err = compute_loops(&env);
+		printf("Irreducible loops count: %d\n", env.loops.irreducible_cnt);
+		for (int i = 0; i < env.loops.irreducible_cnt; i++)
+			printf("  %d\n", env.loops.irreducible[i]);
+		if (err) {
+			log_error("Can't compute dominators\n");
+			goto out;
+		}
+	}
+
 	if (ctx.cfg)
 		print_cfg(&env, ctx.cfg);
 out:
@@ -617,6 +882,7 @@ out:
 	free(env.idoms);
 	free(env.cfg.insn_postorder);
 	free(env.cfg.postorder_nums);
+	free_loops_info(&env.loops);
 	bpf_object__close(obj);
 	return 0;
 }

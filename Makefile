@@ -12,6 +12,7 @@ jfiles+=$(bpf_jfiles)
 dfiles+=$(bpf_dfiles)
 
 selfdir:=$(realpath .)
+
 cc:=clang
 cflags=-g -Wall -fsanitize=address -Wno-override-init
 cflags+=$(shell pkg-config --cflags libbpf)
