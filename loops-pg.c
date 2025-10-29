@@ -35,6 +35,7 @@ struct bpf_verifier_env {
 	int subprog_cnt;
 	struct {
 		int *insn_postorder;
+		int *postorder_nums;
 		int cur_postorder;
 	} cfg;
 };
@@ -129,14 +130,16 @@ enum {
  */
 static int compute_postorder(struct bpf_verifier_env *env)
 {
+	int *stack = NULL, *postorder = NULL, *state = NULL, *postorder_nums = NULL;
 	u32 cur_postorder, i, top, stack_sz, s;
-	int *stack = NULL, *postorder = NULL, *state = NULL;
 	struct bpf_iarray *succ;
 
+	postorder_nums = kvcalloc(env->prog->len, sizeof(int), GFP_KERNEL_ACCOUNT);
 	postorder = kvcalloc(env->prog->len, sizeof(int), GFP_KERNEL_ACCOUNT);
 	state = kvcalloc(env->prog->len, sizeof(int), GFP_KERNEL_ACCOUNT);
 	stack = kvcalloc(env->prog->len, sizeof(int), GFP_KERNEL_ACCOUNT);
-	if (!postorder || !state || !stack) {
+	if (!postorder || !state || !stack || !postorder_nums) {
+		kvfree(postorder_nums);
 		kvfree(postorder);
 		kvfree(state);
 		kvfree(stack);
@@ -151,7 +154,9 @@ static int compute_postorder(struct bpf_verifier_env *env)
 			top = stack[stack_sz - 1];
 			state[top] |= DISCOVERED;
 			if (state[top] & EXPLORED) {
-				postorder[cur_postorder++] = top;
+				postorder[cur_postorder] = top;
+				postorder_nums[top] = cur_postorder;
+				cur_postorder++;
 				stack_sz--;
 				continue;
 			}
@@ -166,6 +171,7 @@ static int compute_postorder(struct bpf_verifier_env *env)
 		} while (stack_sz);
 	}
 	env->subprog_info[i].postorder_start = cur_postorder;
+	env->cfg.postorder_nums = postorder_nums;
 	env->cfg.insn_postorder = postorder;
 	env->cfg.cur_postorder = cur_postorder;
 	kvfree(stack);
@@ -571,6 +577,7 @@ out:
 	}
 	free(env.idoms);
 	free(env.cfg.insn_postorder);
+	free(env.cfg.postorder_nums);
 	bpf_object__close(obj);
 	return 0;
 }
