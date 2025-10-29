@@ -31,6 +31,7 @@ struct bpf_verifier_env {
 	struct bpf_subprog_info *subprog_info;
 	struct bpf_iarray *succ;
 	struct bpf_iarray **preds;
+	int *idoms;
 	int subprog_cnt;
 	struct {
 		int *insn_postorder;
@@ -224,11 +225,112 @@ nomem:
 	return -ENOMEM;
 }
 
+#define iarray_for_each(item, arr)						\
+	for (int ___idx = 0;							\
+	     ___idx < (arr)->cnt && ({ item = (arr)->items[___idx]; 1; });	\
+	     ___idx++)
+
+static int idoms_intersect(struct bpf_verifier_env *env, int a, int b)
+{
+	int *postorder_nums = env->cfg.postorder_nums;
+	int *idoms = env->idoms;
+	int i = 0;
+
+	/*
+	 * fprintf(stderr, "idoms_intersect: a=%d, b=%d\n", a, b);
+	 */
+	while (a != b) {
+		while (postorder_nums[a] < postorder_nums[b]) {
+			/*
+			 * fprintf(stderr, "idoms_intersect: a: po[%d]=%d < po[%d]=%d, %d -> %d\n",
+			 * 	a, postorder_nums[a], b, postorder_nums[b], a, idoms[a]);
+			 */
+			a = idoms[a];
+		}
+		while (postorder_nums[b] < postorder_nums[a]) {
+			/*
+			 * fprintf(stderr, "idoms_intersect: b: po[%d]=%d < po[%d]=%d, %d -> %d\n",
+			 * 	b, postorder_nums[b], a, postorder_nums[a], a, idoms[a]);
+			 */
+			b = idoms[b];
+		}
+		if (i++ > env->prog->len) {
+			fprintf(stderr, "idoms_intersect: infinite loop\n");
+			exit(1);
+		}
+	}
+	return a;
+}
+
+static void compute_subprog_idoms(struct bpf_verifier_env *env, int subprog_idx)
+{
+	struct bpf_subprog_info *subprog = &env->subprog_info[subprog_idx];
+	int start = subprog->start;
+	int end = (subprog + 1)->start;
+	int po_first = subprog->postorder_start;
+	int po_last = (subprog + 1)->postorder_start - 1;
+	int *idoms = env->idoms;
+	int po_num, pred;
+	bool changed;
+
+	idoms[start] = 0;
+	changed = true;
+	do {
+		changed = false;
+		/* iterate in reverse postorder */
+		for (po_num = po_last; po_num >= po_first; po_num--) {
+			int idx = env->cfg.insn_postorder[po_num];
+			struct bpf_iarray *preds;
+			int new_idom = -1;
+
+			iarray_for_each(pred, env->preds[idx]) {
+				/*
+				 * fprintf(stderr, "compute_subprog_idoms: idx=%d, idoms[%d]=%d, new_idom=%d\n",
+				 * 	idx, pred, idoms[pred], new_idom);
+				 */
+				if (idoms[pred] == -1)
+					continue;
+				if (new_idom == -1)
+					new_idom = pred;
+				else
+					new_idom = idoms_intersect(env, pred, new_idom);
+			}
+			if (new_idom != -1 && idoms[idx] != new_idom) {
+				/*
+				 * fprintf(stderr, "compute_subprog_idoms: idoms[%d] = %d\n", idx, new_idom);
+				 */
+				idoms[idx] = new_idom;
+				changed = true;
+			}
+		}
+	} while (changed);
+}
+
+static int compute_idoms(struct bpf_verifier_env *env)
+{
+	u32 len = env->prog->len;
+	int *idoms, i;
+
+	idoms = malloc(sizeof(*idoms) * len);
+	if (!idoms)
+		return -ENOMEM;
+
+	env->idoms = idoms;
+	for (i = 0; i < len; i++)
+		idoms[i] = -1;
+
+	for (i = 0; i < env->subprog_cnt; i++)
+		compute_subprog_idoms(env, i);
+
+	return 0;
+}
+
 struct ctx {
 	char *bpf_file;
 	char *bpf_prog;
 	char *cfg;
 	bool print;
+	bool idoms;
 };
 
 enum {
@@ -236,12 +338,14 @@ enum {
   OPT_BPF_PROG,
   OPT_PRINT,
   OPT_CFG,
+  OPT_IDOMS,
 };
 
 static struct argp_option opts[] = {
   { "bpf-file", OPT_BPF_FILE, "<bpf-file>", 0, 0 },
   { "bpf-prog", OPT_BPF_PROG, "<bpf-prog>", 0, 0 },
   { "cfg", OPT_CFG, "<cfg-dot>", 0, 0 },
+  { "idoms", OPT_IDOMS, 0, 0, 0 },
   { "print", OPT_PRINT, 0, 0, 0 },
   { 0 }
 };
@@ -262,6 +366,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 	  break;
   case OPT_PRINT:
 	  ctx->print = true;
+	  break;
+  case OPT_IDOMS:
+	  ctx->idoms = true;
 	  break;
   case ARGP_KEY_END:
 	  if (!ctx->bpf_file || !ctx->bpf_prog) {
@@ -348,6 +455,11 @@ int print_cfg(struct bpf_verifier_env *env, const char *path)
 		log_error("fopen(%s)", path);
 		return -errno;
 	}
+	int *postorder = calloc(env->prog->len, sizeof(*postorder));
+	if (!postorder)
+		return -ENOMEM;
+	for (int i = 0; i < env->cfg.cur_postorder; i++)
+		postorder[env->cfg.insn_postorder[i]] = i;
 	fprintf(f, "digraph G {\n");
 	fprintf(f, "  node [fontname=monospace, shape=box, style=filled];\n");
 	char buf[INSN_BUF_SZ];
@@ -355,7 +467,8 @@ int print_cfg(struct bpf_verifier_env *env, const char *path)
 	for (int i = 0; i < env->prog->len; i++) {
 		struct bpf_insn *insn = env->prog->insnsi + i;
 		print_insn_str(buf, insn);
-		fprintf(f, "  %d [label=\"%s\"];\n", i, buf);
+		fprintf(f, "  %d [label=\"%d: %-32s p#%d\"];\n",
+			i, i, buf, postorder[i]);
 		succ = bpf_insn_successors(env, i);
 		for (int s = 0; s < succ->cnt; s++)
 			fprintf(f, "  %d -> %d;\n", i, succ->items[s]);
@@ -368,6 +481,7 @@ int print_cfg(struct bpf_verifier_env *env, const char *path)
 			i++;
 
 	}
+	free(postorder);
 	fprintf(f, "}\n");
 	fclose(f);
 	return 0;
@@ -429,14 +543,22 @@ int main(int argc, char *argv[])
 
 	err = compute_postorder(&env);
 	if (err) {
-		log_error("Can't compute postorder");
+		log_error("Can't compute postorder\n");
 		goto out;
 	}
 
 	err = compute_predecessors(&env);
 	if (err) {
-		log_error("Can't compute predecessors");
+		log_error("Can't compute predecessors\n");
 		goto out;
+	}
+
+	if (ctx.idoms) {
+		err = compute_idoms(&env);
+		if (err) {
+			log_error("Can't compute dominators\n");
+			goto out;
+		}
 	}
 
 	if (ctx.cfg)
@@ -447,6 +569,7 @@ out:
 			free(env.preds[i]);
 		free(env.preds);
 	}
+	free(env.idoms);
 	free(env.cfg.insn_postorder);
 	bpf_object__close(obj);
 	return 0;
