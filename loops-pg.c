@@ -454,40 +454,79 @@ static void print_insn(FILE *file, const struct bpf_insn *insn)
 	fprintf(file, "%s\n", buf);
 }
 
-int print_cfg(struct bpf_verifier_env *env, const char *path)
+static int find_span(struct bpf_verifier_env *env, int idx)
+{
+	for (;;) {
+		if (idx == env->prog->len - 1)
+			break;
+		struct bpf_iarray *succ, *preds;
+		int sz = bpf_is_ldimm64(env->prog->insnsi + idx) ? 2 : 1;
+		succ = bpf_insn_successors(env, idx);
+		if (succ->cnt != 1)
+			break;
+		int s = idx + sz;
+		if (succ->items[0] != s)
+			break;
+		preds = env->preds[s];
+		if (preds->cnt != 1 || preds->items[0] != idx)
+			break;
+		if (env->idoms && env->idoms[s] != idx)
+			break;
+		idx += sz;
+	}
+	return idx;
+}
+
+static int print_cfg(struct bpf_verifier_env *env, const char *path)
 {
 	FILE *f = fopen(path, "w");
 	if (!f) {
 		log_error("fopen(%s)", path);
 		return -errno;
 	}
-	int *postorder = calloc(env->prog->len, sizeof(*postorder));
-	if (!postorder)
-		return -ENOMEM;
-	for (int i = 0; i < env->cfg.cur_postorder; i++)
-		postorder[env->cfg.insn_postorder[i]] = i;
 	fprintf(f, "digraph G {\n");
 	fprintf(f, "  node [fontname=monospace, shape=box, style=filled];\n");
 	char buf[INSN_BUF_SZ];
+	int *span_start2end = calloc(env->prog->len, sizeof(int));
+	int *span_end2start = calloc(env->prog->len, sizeof(int));
+	if (!span_start2end || !span_end2start) {
+		free(span_start2end);
+		free(span_end2start);
+		return -ENOMEM;
+	}
+	for (int i = 0; i < env->prog->len; i++) {
+		int j = find_span(env, i);
+		span_start2end[i] = j;
+		span_end2start[j] = i;
+		i = j;
+		if (bpf_is_ldimm64(env->prog->insnsi + i))
+			i++;
+	}
 	struct bpf_iarray *succ, *preds;
 	for (int i = 0; i < env->prog->len; i++) {
-		struct bpf_insn *insn = env->prog->insnsi + i;
-		print_insn_str(buf, insn);
-		fprintf(f, "  %d [label=\"%d: %-32s p#%d\"];\n",
-			i, i, buf, postorder[i]);
-		succ = bpf_insn_successors(env, i);
+		int j = span_start2end[i];
+		fprintf(stderr, "span %d-%d\n", i, j);
+		fprintf(f, "  %d [label=\"", i);
+		for (int k = i; k <= j; k++) {
+			print_insn_str(buf, env->prog->insnsi + k);
+			fprintf(f, "%d: %-32s p#%d", i, buf, env->cfg.postorder_nums[i]);
+			if (i != j)
+				fprintf(f, "\\l");
+			if (bpf_is_ldimm64(env->prog->insnsi + k))
+				k++;
+		}
+		fprintf(f, "\"];\n");
+		succ = bpf_insn_successors(env, j);
 		for (int s = 0; s < succ->cnt; s++)
 			fprintf(f, "  %d -> %d;\n", i, succ->items[s]);
-		/*
-		 * preds = env->preds[i];
-		 * for (int p = 0; p < preds->cnt; p++)
-		 * 	fprintf(f, "  %d -> %d [color=grey];\n", i, preds->items[p]);
-		 */
-		if (bpf_is_ldimm64(insn))
+		if (env->idoms && env->idoms[i] >= 0)
+			fprintf(f, "  %d -> %d [color=red];\n", span_end2start[env->idoms[i]], i);
+		i = j;
+		if (bpf_is_ldimm64(env->prog->insnsi + i))
 			i++;
-
 	}
-	free(postorder);
+	free(span_start2end);
+	free(span_end2start);
 	fprintf(f, "}\n");
 	fclose(f);
 	return 0;
