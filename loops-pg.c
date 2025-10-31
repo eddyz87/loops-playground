@@ -656,59 +656,68 @@ err_out:
 }
 
 struct ctx {
-	char *bpf_file;
+	char **bpf_files;
 	char *bpf_prog;
 	char *cfg;
 	bool print;
 	bool idoms;
 	bool loops;
+	int bpf_files_cnt;
 };
 
 enum {
-  OPT_BPF_FILE = 0x100,
-  OPT_BPF_PROG,
-  OPT_PRINT,
-  OPT_CFG,
-  OPT_IDOMS,
-  OPT_LOOPS,
+	OPT_BPF_PROG = 0x100,
+	OPT_PRINT,
+	OPT_CFG,
+	OPT_IDOMS,
+	OPT_LOOPS,
 };
 
 static struct argp_option opts[] = {
-  { "bpf-file", OPT_BPF_FILE, "<bpf-file>", 0, 0 },
-  { "bpf-prog", OPT_BPF_PROG, "<bpf-prog>", 0, 0 },
-  { "cfg", OPT_CFG, "<cfg-dot>", 0, 0 },
-  { "idoms", OPT_IDOMS, 0, 0, 0 },
-  { "loops", OPT_LOOPS, 0, 0, 0 },
-  { "print", OPT_PRINT, 0, 0, 0 },
-  { 0 }
+	{ "bpf-prog", OPT_BPF_PROG, "<bpf-prog>", 0, 0 },
+	{ "cfg", OPT_CFG, "<cfg-dot>", 0, 0 },
+	{ "idoms", OPT_IDOMS, 0, 0, 0 },
+	{ "loops", OPT_LOOPS, 0, 0, 0 },
+	{ "print", OPT_PRINT, 0, 0, 0 },
+	{ 0 }
 };
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state)
 {
-  struct ctx *ctx = state->input;
+	struct ctx *ctx = state->input;
+	void *tmp;
 
-  switch (key) {
-  case OPT_BPF_FILE:	ctx->bpf_file = arg; break;
-  case OPT_BPF_PROG:	ctx->bpf_prog = arg; break;
-  case OPT_CFG:		ctx->cfg = arg; break;
-  case OPT_PRINT:	ctx->print = true; break;
-  case OPT_IDOMS:	ctx->idoms = true; break;
-  case OPT_LOOPS:	ctx->loops = true; break;
-  case ARGP_KEY_END:
-	  if (!ctx->bpf_file || !ctx->bpf_prog) {
-		  fprintf(stderr, "Mandatory arguments %s and %s are absent\n", opts[0].name, opts[1].name);
-		  argp_state_help(state, stderr, ARGP_HELP_USAGE | ARGP_HELP_EXIT_ERR);
-		  return ARGP_ERR_UNKNOWN;
-	  }
-	  break;
-  default:
-	  return ARGP_ERR_UNKNOWN;
+	switch (key) {
+	case OPT_BPF_PROG:	ctx->bpf_prog = arg; break;
+	case OPT_CFG:		ctx->cfg = arg; break;
+	case OPT_PRINT:	ctx->print = true; break;
+	case OPT_IDOMS:	ctx->idoms = true; break;
+	case OPT_LOOPS:	ctx->loops = true; break;
+	case ARGP_KEY_ARG:
+		tmp = realloc_array(ctx->bpf_files,
+				    ctx->bpf_files_cnt,
+				    ctx->bpf_files_cnt + 1,
+				    sizeof(char *));
+		if (!tmp)
+			return -ENOMEM;
+		ctx->bpf_files = tmp;
+		ctx->bpf_files[ctx->bpf_files_cnt++] = arg;
+		break;
+	case ARGP_KEY_END:
+		if (ctx->bpf_files_cnt == 0) {
+			fprintf(stderr, "No files to process specified\n");
+			argp_state_help(state, stderr, ARGP_HELP_USAGE | ARGP_HELP_EXIT_ERR);
+			return ARGP_ERR_UNKNOWN;
+		}
+		break;
+	default:
+		return ARGP_ERR_UNKNOWN;
   }
   return 0;
 }
 
 static struct argp argp = {
-  opts, parse_opt, NULL, NULL
+  opts, parse_opt, "bpf_files...", NULL
 };
 
 static struct bpf_object *prepare_obj(const char *path, const char *prog_name,
@@ -887,36 +896,22 @@ nomem:
 	return -ENOMEM;
 }
 
-int main(int argc, char *argv[])
+static int max(int a, int b)
 {
+	return a > b ? a : b;
+}
+
+static int process_one_prog(struct ctx *ctx, const char *path, const char *prog_name)
+{
+	int loop_headers_num = -1;
+	int max_loop_nesting = -1;
+	int irreducible_cnt = -1;
+
 	struct bpf_program *prog = NULL;
 	struct bpf_object *obj = NULL;
-	struct ctx ctx = {};
 	int err;
 
-	err = argp_parse(&argp, argc, argv, 0, NULL, &ctx);
-	if (err)
-		goto out;
-
-	obj = prepare_obj(ctx.bpf_file, ctx.bpf_prog, &prog);
-	if (!obj)
-		goto out;
-	if (!prog) {
-		log_error("can't find program '%s'\n", ctx.bpf_prog);
-		goto out;
-	}
-
-	const struct bpf_insn *insns = bpf_program__insns(prog);
-	if (!insns) {
-		log_error("bpf_program__insns");
-		goto out;
-	}
-	int cnt = bpf_program__insn_cnt(prog);
-
-	struct bpf_prog vprog = {
-		.insnsi = (struct bpf_insn *)insns,
-		.len = cnt,
-	};
+	struct bpf_prog vprog;
 	union {
 		struct bpf_iarray arr;
 		u32 _[3];
@@ -926,8 +921,26 @@ int main(int argc, char *argv[])
 		.succ = &succ.arr,
 	};
 
-	if (ctx.print) {
-		for (int i = 0; i < cnt; i++) {
+	fprintf(stderr, "process_one_prog(%s,%s)\n", path, prog_name);
+	obj = prepare_obj(path, prog_name, &prog);
+	if (!obj)
+		goto out;
+	if (!prog) {
+		log_error("can't find program '%s'\n", prog_name);
+		goto out;
+	}
+
+	const struct bpf_insn *insns = bpf_program__insns(prog);
+	if (!insns) {
+		log_error("bpf_program__insns");
+		goto out;
+	}
+
+	vprog.insnsi = (struct bpf_insn *)insns;
+	vprog.len = bpf_program__insn_cnt(prog);
+
+	if (ctx->print) {
+		for (int i = 0; i < vprog.len; i++) {
 			const struct bpf_insn *insn = insns + i;
 			print_insn(stdout, insn);
 			if (bpf_is_ldimm64(insn))
@@ -953,7 +966,7 @@ int main(int argc, char *argv[])
 		goto out;
 	}
 
-	if (ctx.idoms) {
+	if (ctx->idoms) {
 		err = compute_idoms(&env);
 		if (err) {
 			log_error("Can't compute dominators\n");
@@ -961,20 +974,36 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (ctx.loops) {
+	if (ctx->loops) {
 		err = compute_loops(&env);
-		printf("Irreducible loops count: %d\n", env.loops.irreducible_cnt);
-		for (int i = 0; i < env.loops.irreducible_cnt; i++)
-			printf("  %d\n", env.loops.irreducible[i]);
 		if (err) {
-			log_error("Can't compute dominators\n");
+			log_error("Can't compute loop\n");
 			goto out;
+		}
+		/*
+		 * printf("Irreducible loops count: %d\n", env.loops.irreducible_cnt);
+		 * for (int i = 0; i < env.loops.irreducible_cnt; i++)
+		 * 	printf("  %d\n", env.loops.irreducible[i]);
+		 */
+		irreducible_cnt = env.loops.irreducible_cnt;
+		loop_headers_num = 0;
+		for (int i = 0; i < env.prog->len; i++) {
+			loop_headers_num += env.loops.is_header[i] ? 1 : 0;
+			max_loop_nesting = max(max_loop_nesting, get_loop_level(&env, i));
 		}
 	}
 
-	if (ctx.cfg)
-		print_cfg(&env, ctx.cfg);
+	if (ctx->cfg)
+		print_cfg(&env, ctx->cfg);
+
 out:
+	;
+	const char *file_name = strrchr(path, '/');
+	if (file_name)
+		file_name += 1;
+	else
+		file_name = path;
+	printf("%-48s %-32s %-5d %-11d %-11d\n", file_name, prog_name, loop_headers_num, max_loop_nesting, irreducible_cnt);
 	if (env.preds) {
 		for (int i = 0; i < env.prog->len; i++)
 			free(env.preds[i]);
@@ -985,5 +1014,36 @@ out:
 	free(env.cfg.postorder_nums);
 	free_loops_info(&env.loops);
 	bpf_object__close(obj);
+	return 0;
+}
+
+int main(int argc, char *argv[])
+{
+	struct bpf_program *prog;
+	struct bpf_object *obj;
+	struct ctx ctx = {};
+	int err;
+
+	err = argp_parse(&argp, argc, argv, 0, NULL, &ctx);
+	if (err)
+		goto out;
+	printf("%-48s %-32s %-5s %-11s %-11s\n",
+	       "file", "prog", "loops", "max nesting", "irreducible");
+	for (int i = 0; i < ctx.bpf_files_cnt; i++) {
+		const char *bpf_file = ctx.bpf_files[i];
+		if (!ctx.bpf_prog) {
+			obj = bpf_object__open_file(bpf_file, NULL);
+			if (!obj)
+				goto out;
+			bpf_object__for_each_program(prog, obj) {
+				process_one_prog(&ctx, bpf_file, bpf_program__name(prog));
+			}
+			bpf_object__close(obj);
+		} else {
+			process_one_prog(&ctx, bpf_file, ctx.bpf_prog);
+		}
+	}
+out:
+	free(ctx.bpf_files);
 	return 0;
 }
