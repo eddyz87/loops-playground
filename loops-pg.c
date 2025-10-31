@@ -63,14 +63,16 @@ static void free_loops_info(struct loops_info *loops)
 	loops->irreducible = NULL;
 }
 
+#define BPF_MAX_SUBPROGS 256
+
 struct bpf_verifier_env {
 	struct bpf_prog *prog;
-	struct bpf_subprog_info *subprog_info;
+	struct bpf_subprog_info subprog_info[BPF_MAX_SUBPROGS];
 	struct bpf_iarray *succ;
 	struct bpf_iarray **preds;
 	int *idoms;
 	struct loops_info loops;
-	int subprog_cnt;
+	int subprogs_cnt;
 	struct {
 		int *insn_postorder;
 		int *postorder_nums;
@@ -110,6 +112,17 @@ static void *realloc_array(void *arr, size_t old_n, size_t new_n, size_t size)
 static bool bpf_is_ldimm64(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_LD | BPF_IMM | BPF_DW);
+}
+
+static inline bool bpf_pseudo_func(const struct bpf_insn *insn)
+{
+	return bpf_is_ldimm64(insn) && insn->src_reg == BPF_PSEUDO_FUNC;
+}
+
+static bool bpf_pseudo_call(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_CALL) &&
+	       insn->src_reg == BPF_PSEUDO_CALL;
 }
 
 static int bpf_jmp_offset(struct bpf_insn *insn)
@@ -169,6 +182,94 @@ static struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 
 	return succ;
 }
 
+static int cmp_subprogs(const void *a, const void *b)
+{
+	return ((struct bpf_subprog_info *)a)->start -
+	       ((struct bpf_subprog_info *)b)->start;
+}
+
+/* Find subprogram that contains instruction at 'off' */
+struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *env, int off)
+{
+	struct bpf_subprog_info *vals = env->subprog_info;
+	int l, r, m;
+
+	if (off >= env->prog->len || off < 0 || env->subprogs_cnt == 0)
+		return NULL;
+
+	l = 0;
+	r = env->subprogs_cnt - 1;
+	while (l < r) {
+		m = l + (r - l + 1) / 2;
+		if (vals[m].start <= off)
+			l = m;
+		else
+			r = m - 1;
+	}
+	return &vals[l];
+}
+
+/* Find subprogram that starts exactly at 'off' */
+static int find_subprog(struct bpf_verifier_env *env, int off)
+{
+	struct bpf_subprog_info *p;
+
+	p = bpf_find_containing_subprog(env, off);
+	if (!p || p->start != off)
+		return -ENOENT;
+	return p - env->subprog_info;
+}
+
+static int add_subprog(struct bpf_verifier_env *env, int off)
+{
+	int insn_cnt = env->prog->len;
+	int ret;
+
+	if (off >= insn_cnt || off < 0) {
+		log_error("call to invalid destination\n");
+		return -EINVAL;
+	}
+	ret = find_subprog(env, off);
+	if (ret >= 0)
+		return ret;
+	if (env->subprogs_cnt >= BPF_MAX_SUBPROGS) {
+		log_error("too many subprograms\n");
+		return -E2BIG;
+	}
+	/* determine subprog starts. The end is one before the next starts */
+	env->subprog_info[env->subprogs_cnt++].start = off;
+	qsort(env->subprog_info, env->subprogs_cnt,
+	      sizeof(env->subprog_info[0]), cmp_subprogs);
+	return env->subprogs_cnt - 1;
+}
+
+static int add_subprogs(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *subprog = env->subprog_info;
+	int i, ret, insn_cnt = env->prog->len;
+	struct bpf_insn *insn = env->prog->insnsi;
+
+	/* Add entry function. */
+	ret = add_subprog(env, 0);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < insn_cnt; i++, insn++) {
+		if (!bpf_pseudo_func(insn) && !bpf_pseudo_call(insn))
+			continue;
+
+		ret = add_subprog(env, i + insn->imm + 1);
+		if (ret < 0)
+			return ret;
+	}
+
+	/* Add a fake 'exit' subprog which could simplify subprog iteration
+	 * logic. 'subprogs_cnt' should not be increased.
+	 */
+	subprog[env->subprogs_cnt].start = insn_cnt;
+	return 0;
+}
+
 enum {
 	DISCOVERED = 0x1,
 	EXPLORED = 0x2,
@@ -197,7 +298,7 @@ static int compute_postorder(struct bpf_verifier_env *env)
 		return -ENOMEM;
 	}
 	cur_postorder = 0;
-	for (i = 0; i < env->subprog_cnt; i++) {
+	for (i = 0; i < env->subprogs_cnt; i++) {
 		env->subprog_info[i].postorder_start = cur_postorder;
 		stack[0] = env->subprog_info[i].start;
 		stack_sz = 1;
@@ -373,7 +474,7 @@ static int compute_idoms(struct bpf_verifier_env *env)
 	for (i = 0; i < len; i++)
 		idoms[i] = -1;
 
-	for (i = 0; i < env->subprog_cnt; i++)
+	for (i = 0; i < env->subprogs_cnt; i++)
 		compute_subprog_idoms(env, i);
 
 	return 0;
@@ -541,7 +642,7 @@ static int compute_loops(struct bpf_verifier_env *env)
 	}
 	for (i = 0; i < len; i++)
 		loops->loop_header[i] = -1;
-	for (i = 0; i < env->subprog_cnt; i++) {
+	for (i = 0; i < env->subprogs_cnt; i++) {
 		err = assign_loop_headers_in_subprog(env, i);
 		if (err)
 			goto err_out;
@@ -820,15 +921,9 @@ int main(int argc, char *argv[])
 		struct bpf_iarray arr;
 		u32 _[3];
 	} succ;
-	struct bpf_subprog_info subprogs[2] = { // TODO: compute me
-		{ .start = 0 },
-		{ .start = cnt },
-	};
 	struct bpf_verifier_env env = {
 		.prog = &vprog,
 		.succ = &succ.arr,
-		.subprog_info = subprogs,
-		.subprog_cnt = 1,
 	};
 
 	if (ctx.print) {
@@ -838,6 +933,12 @@ int main(int argc, char *argv[])
 			if (bpf_is_ldimm64(insn))
 				i++;
 		}
+	}
+
+	err = add_subprogs(&env);
+	if (err) {
+		log_error("Can't compute subprogs\n");
+		goto out;
 	}
 
 	err = compute_postorder(&env);
