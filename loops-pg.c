@@ -725,12 +725,17 @@ static struct bpf_object *prepare_obj(const char *path, const char *prog_name,
 {
 	struct bpf_program *prog;
 	struct bpf_object *obj;
+	struct bpf_map *map;
 	bool load;
 	int err;
 
 	obj = bpf_object__open_file(path, NULL);
 	if (!obj)
 		return NULL;
+
+	bpf_object__for_each_map(map, obj) {
+		bpf_map__set_autocreate(map, false);
+	}
 
 	bpf_object__for_each_program(prog, obj) {
 		load = strcmp(bpf_program__name(prog), prog_name) == 0;
