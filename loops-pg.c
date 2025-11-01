@@ -1,4 +1,5 @@
 #include <argp.h>
+#include <linux/bpf.h>
 #include <stdarg.h>
 #include <bpf/libbpf.h>
 #include <stdlib.h>
@@ -943,6 +944,9 @@ static int *collect_latches(struct bpf_verifier_env *env, int *cnt)
 	struct loop *loop;
 	void *tmp;
 
+	if (!loops->loop)
+		return NULL;
+
 	*cnt = 0;
 	for (i = 0; i < len; i++) {
 		loop = loops->loop[i];
@@ -1089,6 +1093,10 @@ static int process_one_prog(struct ctx *ctx, const char *path, const char *prog_
 		log_error("can't find program '%s'\n", prog_name);
 		goto out;
 	}
+	if (bpf_program__type(prog) == BPF_PROG_TYPE_STRUCT_OPS) {
+		log_error("skipping struct_ops program '%s'\n", prog_name);
+		goto out;
+	}
 
 	const struct bpf_insn *insns = bpf_program__insns(prog);
 	if (!insns) {
@@ -1147,6 +1155,7 @@ static int process_one_prog(struct ctx *ctx, const char *path, const char *prog_
 		 */
 		irreducible_cnt = 0;
 		max_backedges_cnt = 0;
+		max_loop_nesting = 0;
 		loop_headers_num = 0;
 		backedges_wo_latch = 0;
 		for (int i = 0; i < env.prog->len; i++) {
@@ -1192,6 +1201,13 @@ out:
 	return 0;
 }
 
+static int libbpf_debug_print(enum libbpf_print_level level,
+			      const char *format, va_list args)
+{
+	vfprintf(stderr, format, args);
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	struct bpf_program *prog;
@@ -1204,12 +1220,16 @@ int main(int argc, char *argv[])
 		goto out;
 	printf("%-48s %-32s %-5s %-11s %-11s %-13s %-8s %-8s\n",
 	       "file", "prog", "loops", "max_nesting", "irreducible", "max_backedges", "overflow", "no_latch");
+	if (0)
+		libbpf_set_print(libbpf_debug_print);
 	for (int i = 0; i < ctx.bpf_files_cnt; i++) {
 		const char *bpf_file = ctx.bpf_files[i];
 		if (!ctx.bpf_prog) {
 			obj = bpf_object__open_file(bpf_file, NULL);
-			if (!obj)
-				goto out;
+			if (!obj) {
+				log_error("can't open file %s\n", bpf_file);
+				continue;
+			}
 			bpf_object__for_each_program(prog, obj) {
 				process_one_prog(&ctx, bpf_file, bpf_program__name(prog));
 			}
