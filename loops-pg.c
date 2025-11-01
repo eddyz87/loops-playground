@@ -474,6 +474,7 @@ static void compute_subprog_idoms(struct bpf_verifier_env *env, int subprog_idx)
 			}
 		}
 	} while (changed);
+	idoms[start] = -1;
 }
 
 static int compute_idoms(struct bpf_verifier_env *env)
@@ -556,6 +557,52 @@ static int assign_header(struct loops_info *loops, int n, int h)
 	}
 	loop_header[n] = h;
 	return 0;
+}
+
+static bool is_cond_jmp_insn(struct bpf_insn *insn)
+{
+	u8 class = BPF_CLASS(insn->code);
+	u8 opcode = BPF_OP(insn->code);
+
+	if (class != BPF_JMP && class != BPF_JMP32)
+		return false;
+
+	switch (opcode) {
+	case BPF_JEQ:
+	case BPF_JGE:
+	case BPF_JGT:
+	case BPF_JLE:
+	case BPF_JLT:
+	case BPF_JNE:
+	case BPF_JSET:
+	case BPF_JSGE:
+	case BPF_JSGT:
+	case BPF_JSLE:
+	case BPF_JSLT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int find_dominating_condition(struct bpf_verifier_env *env, int n, int top)
+{
+	struct bpf_insn *insns = env->prog->insnsi;
+	int *idoms = env->idoms;
+	int common_dom;
+
+
+	common_dom = idoms_intersect(env, n, top);
+	if (common_dom != top)
+		return -1;
+	while (n >= 0) {
+		if (is_cond_jmp_insn(&insns[n]))
+			return n;
+		if (n == top)
+			break;
+		n = idoms[n];
+	}
+	return -1;
 }
 
 /*
@@ -661,8 +708,10 @@ static int compute_loops_in_subprog(struct bpf_verifier_env *env, int subprog_id
 
 static int compute_loops(struct bpf_verifier_env *env)
 {
-	int err, i, len = env->prog->len;
+	int err, i, j, len = env->prog->len;
 	struct loops_info *loops = &env->loops;
+	struct backedge *backedge;
+	struct loop *loop;
 
 	loops->loop_header = kvcalloc(len, sizeof(int), GFP_KERNEL_ACCOUNT);
 	loops->loop = kvcalloc(len, sizeof(*loops->loop), GFP_KERNEL_ACCOUNT);
@@ -679,6 +728,16 @@ static int compute_loops(struct bpf_verifier_env *env)
 		err = compute_loops_in_subprog(env, i);
 		if (err)
 			goto err_out;
+	}
+	/* find latches */
+	for (i = 0; i < len; i++) {
+		loop = loops->loop[i];
+		if (!loop)
+			continue;
+		for (j = 0; j < loop->backedges_cnt; j++) {
+			backedge = &loop->backedges[j];
+			backedge->latch = find_dominating_condition(env, backedge->from, i);
+		}
 	}
 	free_loops_info_tmps(loops);
 	return 0;
@@ -864,6 +923,50 @@ static int get_loop_level(struct bpf_verifier_env *env, int idx)
 	return level;
 }
 
+static bool array_find(int *arr, int cnt, int item)
+{
+	int i;
+
+	if (!arr)
+		return false;
+	for (i = 0; i < cnt; i++)
+		if (arr[i] == item)
+			return true;
+	return false;
+}
+
+static int *collect_latches(struct bpf_verifier_env *env, int *cnt)
+{
+	int *latches = NULL, len = env->prog->len, i, j;
+	struct loops_info *loops = &env->loops;
+	struct backedge *backedge;
+	struct loop *loop;
+	void *tmp;
+
+	*cnt = 0;
+	for (i = 0; i < len; i++) {
+		loop = loops->loop[i];
+		if (!loop)
+			continue;
+		for (j = 0; j < loop->backedges_cnt; j++) {
+			backedge = &loop->backedges[j];
+			if (backedge->latch == -1 ||
+			    array_find(latches, *cnt, backedge->latch))
+				continue;
+			tmp = realloc_array(latches, *cnt, *cnt + 1, sizeof(int));
+			if (!tmp) {
+				free(latches);
+				*cnt = 0;
+				return NULL;
+			}
+			latches = tmp;
+			latches[*cnt] = backedge->latch;
+			*cnt += 1;
+		}
+	}
+	return latches;
+}
+
 static int print_cfg(struct bpf_verifier_env *env, const char *path)
 {
 	FILE *f = fopen(path, "w");
@@ -874,6 +977,8 @@ static int print_cfg(struct bpf_verifier_env *env, const char *path)
 	fprintf(f, "digraph G {\n");
 	fprintf(f, "  node [fontname=monospace, shape=box, style=filled];\n");
 	char buf[INSN_BUF_SZ];
+	int latches_cnt;
+	int *latches = collect_latches(env, &latches_cnt);
 	int *span_start2end = calloc(env->prog->len, sizeof(int));
 	int *span_end2start = calloc(env->prog->len, sizeof(int));
 	if (!span_start2end || !span_end2start)
@@ -890,6 +995,7 @@ static int print_cfg(struct bpf_verifier_env *env, const char *path)
 	for (int i = 0; i < env->prog->len; i++) {
 		int j = span_start2end[i];
 		fprintf(f, "  %d [label=\"", i);
+		bool is_latch = false;
 		for (int k = i; k <= j; k++) {
 			print_insn_str(buf, env->prog->insnsi + k);
 			fprintf(f, "%d: %-32s p#%-3d",
@@ -899,6 +1005,10 @@ static int print_cfg(struct bpf_verifier_env *env, const char *path)
 				fprintf(f, " l#%-3d", l);
 			if (env->loops.loop && env->loops.loop[k])
 				fprintf(f, " h(bc=%d)", env->loops.loop[k]->backedges_cnt);
+			if (array_find(latches, latches_cnt, k)) {
+				fprintf(f, " latch");
+				is_latch = true;
+			}
 			if (i != j)
 				fprintf(f, "\\l");
 			if (bpf_is_ldimm64(env->prog->insnsi + k))
@@ -913,6 +1023,8 @@ static int print_cfg(struct bpf_verifier_env *env, const char *path)
 			else
 				fprintf(f, ", colorscheme=pastel27");
 		}
+		if (is_latch)
+			fprintf(f, ", penwidth=3");
 		fprintf(f, "];\n");
 		succ = bpf_insn_successors(env, j);
 		int s;
@@ -930,12 +1042,14 @@ static int print_cfg(struct bpf_verifier_env *env, const char *path)
 	}
 	free(span_start2end);
 	free(span_end2start);
+	free(latches);
 	fprintf(f, "}\n");
 	fclose(f);
 	return 0;
 nomem:
 	free(span_start2end);
 	free(span_end2start);
+	free(latches);
 	return -ENOMEM;
 }
 
@@ -950,6 +1064,7 @@ static int process_one_prog(struct ctx *ctx, const char *path, const char *prog_
 	int max_loop_nesting = -1;
 	int max_backedges_cnt = -1;
 	int irreducible_cnt = -1;
+	int backedges_wo_latch = -1;
 	bool backedges_overflow = false;
 
 	struct bpf_program *prog = NULL;
@@ -1033,6 +1148,7 @@ static int process_one_prog(struct ctx *ctx, const char *path, const char *prog_
 		irreducible_cnt = 0;
 		max_backedges_cnt = 0;
 		loop_headers_num = 0;
+		backedges_wo_latch = 0;
 		for (int i = 0; i < env.prog->len; i++) {
 			struct loop *loop = env.loops.loop[i];
 
@@ -1045,6 +1161,8 @@ static int process_one_prog(struct ctx *ctx, const char *path, const char *prog_
 			max_loop_nesting = max(max_loop_nesting, get_loop_level(&env, i));
 			max_backedges_cnt = max(max_backedges_cnt, loop->backedges_cnt);
 			backedges_overflow |= loop->backedges_overflow;
+			for (int j = 0; j < loop->backedges_cnt; j++)
+				backedges_wo_latch += loop->backedges[j].latch == -1 ? 1 : 0;
 		}
 	}
 
@@ -1058,9 +1176,9 @@ out:
 		file_name += 1;
 	else
 		file_name = path;
-	printf("%-48s %-32s %-5d %-11d %-11d %-13d %-8d\n",
+	printf("%-48s %-32s %-5d %-11d %-11d %-13d %-8d %-8d\n",
 	       file_name, prog_name, loop_headers_num, max_loop_nesting, irreducible_cnt,
-	       max_backedges_cnt, backedges_overflow);
+	       max_backedges_cnt, backedges_overflow, backedges_wo_latch);
 	if (env.preds) {
 		for (int i = 0; i < env.prog->len; i++)
 			free(env.preds[i]);
@@ -1084,8 +1202,8 @@ int main(int argc, char *argv[])
 	err = argp_parse(&argp, argc, argv, 0, NULL, &ctx);
 	if (err)
 		goto out;
-	printf("%-48s %-32s %-5s %-11s %-11s %-13s %-18s\n",
-	       "file", "prog", "loops", "max_nesting", "irreducible", "max_backedges", "overflow");
+	printf("%-48s %-32s %-5s %-11s %-11s %-13s %-8s %-8s\n",
+	       "file", "prog", "loops", "max_nesting", "irreducible", "max_backedges", "overflow", "no_latch");
 	for (int i = 0; i < ctx.bpf_files_cnt; i++) {
 		const char *bpf_file = ctx.bpf_files[i];
 		if (!ctx.bpf_prog) {
