@@ -31,16 +31,27 @@ struct dfs_state {
 	u32 next_succ:31;
 };
 
-struct loops_info {
-	struct dfs_state *state;/* temporary variable */
-	bool *is_header;	/* true, if node is a loop header */
-	int *loop_header;	/* maps instruction at index to it's innermost loop header */
-	int *irreducible;	/* list of irreducible loop headers */
-	int *dfs_pos;		/* temporary variable */
-	int *stack;		/* temporary variable */
-	int irreducible_cnt;	/* number of elements in irreducible */
+#define MAX_BACKEDGES 16
+
+struct backedge {
+	int from;
+	int latch; /* -1 if no latch can be found */
 };
 
+struct loop {
+	struct backedge backedges[MAX_BACKEDGES];
+	int backedges_cnt;
+	bool irreducible;
+	bool backedges_overflow;
+};
+
+struct loops_info {
+	struct dfs_state *state;/* temporary variable */
+	struct loop **loop;	/* loop info, if current insn is a loop header */
+	int *loop_header;	/* maps instruction at index to it's innermost loop header */
+	int *dfs_pos;		/* temporary variable */
+	int *stack;		/* temporary variable */
+};
 
 static void free_loops_info_tmps(struct loops_info *loops)
 {
@@ -52,15 +63,19 @@ static void free_loops_info_tmps(struct loops_info *loops)
 	loops->state = NULL;
 }
 
-static void free_loops_info(struct loops_info *loops)
+static void free_loops_info(struct loops_info *loops, int len)
 {
+	int i;
+
+	if (loops->loop) {
+		for (i = 0; i < len; i++)
+			free(loops->loop[i]);
+		free(loops->loop);
+	}
 	free_loops_info_tmps(loops);
-	free(loops->is_header);
 	free(loops->loop_header);
-	free(loops->irreducible);
-	loops->is_header = NULL;
 	loops->loop_header = NULL;
-	loops->irreducible = NULL;
+	loops->loop = NULL;
 }
 
 #define BPF_MAX_SUBPROGS 256
@@ -480,43 +495,57 @@ static int compute_idoms(struct bpf_verifier_env *env)
 	return 0;
 }
 
-static int mark_irreducible(struct loops_info *loops, int header)
+static void mark_irreducible(struct loops_info *loops, int h)
 {
-	int *irreducible;
+	loops->loop[h]->irreducible = true;
+}
 
-	irreducible = realloc_array(loops->irreducible,
-				    loops->irreducible_cnt,
-				    loops->irreducible_cnt + 1,
-				    sizeof(int));
-	if (!irreducible)
-		return -ENOMEM;
+static void add_backedge(struct loops_info *loops, int from, int h)
+{
+	struct loop *loop = loops->loop[h];
+	int cnt = loop->backedges_cnt;
 
-	loops->irreducible = irreducible;
-	irreducible[loops->irreducible_cnt++] = header;
+	if (cnt == MAX_BACKEDGES) {
+		loop->backedges_overflow = true;
+		return;
+	}
+	loop->backedges[cnt].from = from;
+	loop->backedges[cnt].latch = -1;
+	loop->backedges_cnt++;
+}
+
+static int mark_header(struct loops_info *loops, int h)
+{
+	if (!loops->loop[h]) {
+		loops->loop[h] = calloc(1, sizeof(struct loop));
+		if (!loops->loop[h])
+			return -ENOMEM;
+	}
 	return 0;
 }
 
-static void assign_header(struct loops_info *loops, int n, int h)
+static int assign_header(struct loops_info *loops, int n, int h)
 {
 	int *loop_header = loops->loop_header;
-	bool *is_header = loops->is_header;
 	int *dfs_pos = loops->dfs_pos;
-	int nh;
+	int err, nh;
 
 	/*
 	 * printf("assign_header(n=%d, h=%d)\n", n, h);
 	 */
-	is_header[h] = true;
+	err = mark_header(loops, h);
+	if (err)
+		return err;
 
 	/* Don't encode self-loops, otherwise can't reflect loops nesting structure. */
 	if (n == h)
-		return;
+		return 0;
 
 	/* Make sure that loop headers up the chain are sorted by dfs_pos. */
 	while (loop_header[n] != -1) {
 		nh = loop_header[n];
 		if (nh == h)
-			return;
+			return 0;
 		if (dfs_pos[nh] < dfs_pos[h]) {
 			loop_header[n] = h;
 			n = h;
@@ -526,13 +555,14 @@ static void assign_header(struct loops_info *loops, int n, int h)
 		}
 	}
 	loop_header[n] = h;
+	return 0;
 }
 
 /*
  * As described in "A New Algorithm for Identifying Loops in Decompilation" by Wei et al,
  * adapted to be non-recursive.
  */
-static int assign_loop_headers_in_subprog(struct bpf_verifier_env *env, int subprog_idx)
+static int compute_loops_in_subprog(struct bpf_verifier_env *env, int subprog_idx)
 {
 	struct loops_info *loops = &env->loops;
 	struct dfs_state *state = loops->state;
@@ -582,7 +612,10 @@ static int assign_loop_headers_in_subprog(struct bpf_verifier_env *env, int subp
 			 *                 '----------'
 			 * Case B: 's' is in the current DFS path.
 			 */
-			assign_header(loops, cur, s);
+			err = assign_header(loops, cur, s);
+			if (err)
+				return err;
+			add_backedge(loops, cur, s);
 		} else if (loop_header[s] == -1) {
 			/*
 			 * start -> ... -> ... -> s -> ... -> end
@@ -601,23 +634,23 @@ static int assign_loop_headers_in_subprog(struct bpf_verifier_env *env, int subp
 			 * Case D: 's' is explored, not in current DFS path,
 			 * but it's innermost loop header is.
 			 */
-			assign_header(loops, cur, loop_header[s]);
+			err = assign_header(loops, cur, loop_header[s]);
+			if (err)
+				return err;
 		} else {
 			// case E
 			h = loop_header[s];
-			err = mark_irreducible(loops, h);
-			if (err)
-				return err;
+			mark_irreducible(loops, h);
 			/* can also mark 's' as reentry, but no need for now */
 			while (loop_header[h] != -1) {
 				h = loop_header[h];
 				if (dfs_pos[h]) {
-					assign_header(loops, cur, h);
+					err = assign_header(loops, cur, h);
+					if (err)
+						return err;
 					break;
 				}
-				err = mark_irreducible(loops, h);
-				if (err)
-					return err;
+				mark_irreducible(loops, h);
 			}
 		}
 		state[cur].next_succ++;
@@ -632,18 +665,18 @@ static int compute_loops(struct bpf_verifier_env *env)
 	struct loops_info *loops = &env->loops;
 
 	loops->loop_header = kvcalloc(len, sizeof(int), GFP_KERNEL_ACCOUNT);
-	loops->is_header = kvcalloc(len, sizeof(bool), GFP_KERNEL_ACCOUNT);
+	loops->loop = kvcalloc(len, sizeof(*loops->loop), GFP_KERNEL_ACCOUNT);
 	loops->dfs_pos = kvcalloc(len, sizeof(int), GFP_KERNEL_ACCOUNT);
 	loops->state = kvcalloc(len, sizeof(struct dfs_state), GFP_KERNEL_ACCOUNT);
 	loops->stack = kvcalloc(len, sizeof(int), GFP_KERNEL_ACCOUNT);
-	if (!loops->loop_header || !loops->dfs_pos || !loops->state || !loops->stack) {
+	if (!loops->loop_header || !loops->loop || !loops->dfs_pos || !loops->state || !loops->stack) {
 		err = -ENOMEM;
 		goto err_out;
 	}
 	for (i = 0; i < len; i++)
 		loops->loop_header[i] = -1;
 	for (i = 0; i < env->subprogs_cnt; i++) {
-		err = assign_loop_headers_in_subprog(env, i);
+		err = compute_loops_in_subprog(env, i);
 		if (err)
 			goto err_out;
 	}
@@ -651,7 +684,7 @@ static int compute_loops(struct bpf_verifier_env *env)
 	return 0;
 
 err_out:
-	free_loops_info(loops);
+	free_loops_info(loops, len);
 	return err;
 }
 
@@ -804,7 +837,7 @@ static int find_span(struct bpf_verifier_env *env, int idx)
 			break;
 		if (env->idoms && env->idoms[s] != idx)
 			break;
-		if (env->loops.is_header && env->loops.is_header[s])
+		if (env->loops.loop && env->loops.loop[s])
 			break;
 		idx += sz;
 	}
@@ -818,11 +851,11 @@ static int get_loop_level(struct bpf_verifier_env *env, int idx)
 	struct loops_info *loops = &env->loops;
 	int level;
 
-	if (!loops->is_header)
+	if (!loops->loop)
 		return 0;
 
 	level = 0;
-	if (loops->is_header[idx])
+	if (loops->loop[idx])
 		level += 1;
 	while (loops->loop_header[idx] != -1) {
 		idx = loops->loop_header[idx];
@@ -864,8 +897,8 @@ static int print_cfg(struct bpf_verifier_env *env, const char *path)
 			int l;
 			if (env->loops.loop_header && ((l = env->loops.loop_header[k]) != -1))
 				fprintf(f, " l#%-3d", l);
-			if (env->loops.is_header && env->loops.is_header[k])
-				fprintf(f, " h");
+			if (env->loops.loop && env->loops.loop[k])
+				fprintf(f, " h(bc=%d)", env->loops.loop[k]->backedges_cnt);
 			if (i != j)
 				fprintf(f, "\\l");
 			if (bpf_is_ldimm64(env->prog->insnsi + k))
@@ -875,15 +908,20 @@ static int print_cfg(struct bpf_verifier_env *env, const char *path)
 		int loop_level = get_loop_level(env, i);
 		if (loop_level) {
 			fprintf(f, ", fillcolor=%d", loop_level % MAX_LOOP_COLORS);
-			if (env->loops.is_header[i])
+			if (env->loops.loop[i])
 				fprintf(f, ", colorscheme=set27");
 			else
 				fprintf(f, ", colorscheme=pastel27");
 		}
 		fprintf(f, "];\n");
 		succ = bpf_insn_successors(env, j);
-		for (int s = 0; s < succ->cnt; s++)
-			fprintf(f, "  %d -> %d;\n", i, succ->items[s]);
+		int s;
+		iarray_for_each(s, succ) {
+			fprintf(f, "  %d -> %d [", i, s);
+			if (env->loops.loop_header && env->loops.loop_header[j] == s)
+				fprintf(f, "penwidth=5, color=blue");
+			fprintf(f, "];\n");
+		}
 		if (env->idoms && env->idoms[i] >= 0)
 			fprintf(f, "  %d -> %d [color=red];\n", span_end2start[env->idoms[i]], i);
 		i = j;
@@ -910,7 +948,9 @@ static int process_one_prog(struct ctx *ctx, const char *path, const char *prog_
 {
 	int loop_headers_num = -1;
 	int max_loop_nesting = -1;
+	int max_backedges_cnt = -1;
 	int irreducible_cnt = -1;
+	bool backedges_overflow = false;
 
 	struct bpf_program *prog = NULL;
 	struct bpf_object *obj = NULL;
@@ -990,11 +1030,21 @@ static int process_one_prog(struct ctx *ctx, const char *path, const char *prog_
 		 * for (int i = 0; i < env.loops.irreducible_cnt; i++)
 		 * 	printf("  %d\n", env.loops.irreducible[i]);
 		 */
-		irreducible_cnt = env.loops.irreducible_cnt;
+		irreducible_cnt = 0;
+		max_backedges_cnt = 0;
 		loop_headers_num = 0;
 		for (int i = 0; i < env.prog->len; i++) {
-			loop_headers_num += env.loops.is_header[i] ? 1 : 0;
+			struct loop *loop = env.loops.loop[i];
+
+			if (!loop)
+				continue;
+
+			loop_headers_num++;
+			if (loop->irreducible)
+				irreducible_cnt++;
 			max_loop_nesting = max(max_loop_nesting, get_loop_level(&env, i));
+			max_backedges_cnt = max(max_backedges_cnt, loop->backedges_cnt);
+			backedges_overflow |= loop->backedges_overflow;
 		}
 	}
 
@@ -1008,7 +1058,9 @@ out:
 		file_name += 1;
 	else
 		file_name = path;
-	printf("%-48s %-32s %-5d %-11d %-11d\n", file_name, prog_name, loop_headers_num, max_loop_nesting, irreducible_cnt);
+	printf("%-48s %-32s %-5d %-11d %-11d %-13d %-8d\n",
+	       file_name, prog_name, loop_headers_num, max_loop_nesting, irreducible_cnt,
+	       max_backedges_cnt, backedges_overflow);
 	if (env.preds) {
 		for (int i = 0; i < env.prog->len; i++)
 			free(env.preds[i]);
@@ -1017,7 +1069,7 @@ out:
 	free(env.idoms);
 	free(env.cfg.insn_postorder);
 	free(env.cfg.postorder_nums);
-	free_loops_info(&env.loops);
+	free_loops_info(&env.loops, env.prog->len);
 	bpf_object__close(obj);
 	return 0;
 }
@@ -1032,8 +1084,8 @@ int main(int argc, char *argv[])
 	err = argp_parse(&argp, argc, argv, 0, NULL, &ctx);
 	if (err)
 		goto out;
-	printf("%-48s %-32s %-5s %-11s %-11s\n",
-	       "file", "prog", "loops", "max nesting", "irreducible");
+	printf("%-48s %-32s %-5s %-11s %-11s %-13s %-18s\n",
+	       "file", "prog", "loops", "max_nesting", "irreducible", "max_backedges", "overflow");
 	for (int i = 0; i < ctx.bpf_files_cnt; i++) {
 		const char *bpf_file = ctx.bpf_files[i];
 		if (!ctx.bpf_prog) {
